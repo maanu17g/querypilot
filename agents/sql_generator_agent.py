@@ -7,14 +7,19 @@ Responsibilities:
   - Validate generated SQL for safety
   - Graceful fallback when question is out of scope
   - Robust handling of malformed/empty model responses
+  - Standardized error codes (see app/errors.py)
 """
 
+import logging
 import re
 
 from groq import Groq
 
 from config import GROQ_API_KEY, GROQ_MODEL
 from agents.sql_validator import validate_sql
+from app.errors import ErrorCode, MESSAGES, classify_llm_error
+
+logger = logging.getLogger(__name__)
 
 
 _SYSTEM_PROMPT = """You are an expert PostgreSQL query writer.
@@ -35,6 +40,17 @@ Rules:
 """
 
 
+def _fail(code: str, message: str | None = None, **extra) -> dict:
+    """Build a standard failure result."""
+    result = {
+        "sql": None,
+        "error": message or MESSAGES[code],
+        "error_code": code,
+    }
+    result.update(extra)
+    return result
+
+
 class SQLGeneratorAgent:
 
     def __init__(self) -> None:
@@ -45,10 +61,10 @@ class SQLGeneratorAgent:
         Generate SQL from a natural-language question.
 
         Returns:
-            {
-                "sql": "<query>" | None,
-                "error": None | "<message>"
-            }
+            {"sql": "<query>", "error": None, "error_code": None}
+            or
+            {"sql": None, "error": "<message>", "error_code": "<CODE>"}
+            (plus "rate_limited": True when Groq returned a 429)
         """
 
         user_msg = (
@@ -79,18 +95,18 @@ class SQLGeneratorAgent:
                 or not getattr(resp.choices[0], "message", None)
                 or not getattr(resp.choices[0].message, "content", None)
             ):
-                return {
-                    "sql": None,
-                    "error": "SQL generation returned an empty response."
-                }
+                return _fail(
+                    ErrorCode.SQL_GENERATION_FAILED,
+                    "SQL generation returned an empty response.",
+                )
 
             raw = resp.choices[0].message.content.strip()
 
             if not raw:
-                return {
-                    "sql": None,
-                    "error": "SQL generation returned an empty response."
-                }
+                return _fail(
+                    ErrorCode.SQL_GENERATION_FAILED,
+                    "SQL generation returned an empty response.",
+                )
 
             # Remove accidental markdown code fences
             raw = re.sub(
@@ -100,59 +116,49 @@ class SQLGeneratorAgent:
             ).replace("```", "").strip()
 
             if not raw:
-                return {
-                    "sql": None,
-                    "error": "SQL generation returned an empty response."
-                }
+                return _fail(
+                    ErrorCode.SQL_GENERATION_FAILED,
+                    "SQL generation returned an empty response.",
+                )
 
             # Handle unsupported questions
             if raw.upper().startswith("UNSUPPORTED_QUERY"):
-                return {
-                    "sql": None,
-                    "error": (
-                        "This question cannot be answered "
-                        "from the available schema."
-                    )
-                }
+                return _fail(
+                    ErrorCode.SQL_GENERATION_FAILED,
+                    "This question cannot be answered from the available schema.",
+                )
 
             # Validate generated SQL before returning it
             is_valid, validation_error = validate_sql(raw)
 
             if not is_valid:
-                return {
-                    "sql": None,
-                    "error": validation_error
-                }
+                return _fail(ErrorCode.SQL_REJECTED, validation_error)
 
-            return {
-                "sql": raw,
-                "error": None
-            }
+            return {"sql": raw, "error": None, "error_code": None}
 
         except Exception as exc:
+            code = classify_llm_error(exc)
+            logger.error("SQL generation failed [%s]: %r | cause=%r",
+                         code, exc, exc.__cause__)
+
             err_str = str(exc)
+            if (code == ErrorCode.LLM_RATE_LIMITED
+                    or "429" in err_str
+                    or "rate_limit" in err_str.lower()):
+                # Pipeline checks this flag to fall back to the vector cache
+                return _fail(ErrorCode.LLM_RATE_LIMITED, "RATE_LIMIT",
+                             rate_limited=True)
 
-            if "429" in err_str or "rate_limit" in err_str.lower():
-                return {
-                    "sql": None,
-                    "error": "RATE_LIMIT",
-                    "rate_limited": True
-                }
-
-            return {
-                "sql": None,
-                "error": f"SQL generation failed: {exc}"
-            }
+            return _fail(code, "SQL generation failed. " + MESSAGES[code] if code == ErrorCode.SQL_GENERATION_FAILED else None)
 
     def fix(self, question: str, bad_sql: str, db_error: str) -> dict:
         """
         Attempt to correct SQL that failed during database execution.
 
         Returns:
-            {
-                "sql": "<corrected query>" | None,
-                "error": None | "<message>"
-            }
+            {"sql": "<corrected query>", "error": None, "error_code": None}
+            or
+            {"sql": None, "error": "<message>", "error_code": "<CODE>"}
         """
 
         user_msg = (
@@ -186,18 +192,18 @@ class SQLGeneratorAgent:
                 or not getattr(resp.choices[0], "message", None)
                 or not getattr(resp.choices[0].message, "content", None)
             ):
-                return {
-                    "sql": None,
-                    "error": "SQL fix returned an empty response."
-                }
+                return _fail(
+                    ErrorCode.SQL_GENERATION_FAILED,
+                    "SQL fix returned an empty response.",
+                )
 
             raw = resp.choices[0].message.content.strip()
 
             if not raw:
-                return {
-                    "sql": None,
-                    "error": "SQL fix returned an empty response."
-                }
+                return _fail(
+                    ErrorCode.SQL_GENERATION_FAILED,
+                    "SQL fix returned an empty response.",
+                )
 
             # Remove accidental markdown code fences
             raw = re.sub(
@@ -207,30 +213,24 @@ class SQLGeneratorAgent:
             ).replace("```", "").strip()
 
             if not raw:
-                return {
-                    "sql": None,
-                    "error": "SQL fix returned an empty response."
-                }
+                return _fail(
+                    ErrorCode.SQL_GENERATION_FAILED,
+                    "SQL fix returned an empty response.",
+                )
 
             # Validate corrected SQL before retrying it
             is_valid, validation_error = validate_sql(raw)
 
             if not is_valid:
-                return {
-                    "sql": None,
-                    "error": (
-                        f"Fix attempt produced unsafe SQL: "
-                        f"{validation_error}"
-                    )
-                }
+                return _fail(
+                    ErrorCode.SQL_REJECTED,
+                    f"Fix attempt produced unsafe SQL: {validation_error}",
+                )
 
-            return {
-                "sql": raw,
-                "error": None
-            }
+            return {"sql": raw, "error": None, "error_code": None}
 
         except Exception as exc:
-            return {
-                "sql": None,
-                "error": f"Fix attempt failed: {exc}"
-            }
+            code = classify_llm_error(exc)
+            logger.error("SQL fix attempt failed [%s]: %r | cause=%r",
+                         code, exc, exc.__cause__)
+            return _fail(code, f"Fix attempt failed: {MESSAGES[code]}")
