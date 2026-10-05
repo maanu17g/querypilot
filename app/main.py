@@ -8,26 +8,37 @@ Endpoints:
   GET  /schema   — returns full DB schema as JSON
   GET  /health   — DB connectivity check
   GET  /         — serves the HTML frontend
+
+All errors carry a stable `error_code` (see app/errors.py).
 """
 
-import os, shutil, tempfile
+import logging
+import os
+import shutil
+import tempfile
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.staticfiles import StaticFiles
+from fastapi import FastAPI, HTTPException, Request, UploadFile, File
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.exceptions import HTTPException as StarletteHTTPException
 
+from app.errors import ErrorCode, MESSAGES, classify_llm_error, error_body
 from database.connection import init_pool, close_pool
-from agents.schema_agent        import SchemaAgent
+from agents.schema_agent import SchemaAgent
 from agents.sql_generator_agent import SQLGeneratorAgent
-from agents.retriever_agent     import RetrieverAgent
-from agents.synthesizer_agent   import SynthesizerAgent
-from agents.vector_store        import VectorStore
-from agents.doc_store           import DocStore
+from agents.retriever_agent import RetrieverAgent
+from agents.synthesizer_agent import SynthesizerAgent
+from agents.vector_store import VectorStore
+from agents.doc_store import DocStore
 
+logger = logging.getLogger(__name__)
 
 # ── lifespan (startup / shutdown) ─────────────────────────────────────────────
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -45,23 +56,54 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+
+# ── global error handlers (standard format everywhere) ────────────────────────
+
+@app.exception_handler(RequestValidationError)
+async def validation_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=422,
+        content=error_body(ErrorCode.INVALID_REQUEST,
+                           jsonable_encoder(exc.errors())),
+    )
+
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    code = (ErrorCode.INVALID_REQUEST if 400 <= exc.status_code < 500
+            else ErrorCode.INTERNAL_ERROR)
+    message = str(exc.detail)
+    return JSONResponse(
+        status_code=exc.status_code,
+        # "detail" kept for backward compatibility with older clients/tests
+        content={"error": message, "error_code": code, "detail": message},
+    )
+
+
+@app.exception_handler(Exception)
+async def unhandled_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled error on %s", request.url.path)
+    return JSONResponse(status_code=500, content=error_body(ErrorCode.INTERNAL_ERROR))
+
+
 # Serve frontend files at /static/*
 _FRONTEND = os.path.join(os.path.dirname(__file__), "..", "frontend")
 app.mount("/static", StaticFiles(directory=_FRONTEND), name="static")
 
 # ── agent singletons (shared across requests) ─────────────────────────────────
-schema_agent    = SchemaAgent()
-sql_agent       = SQLGeneratorAgent()
+schema_agent = SchemaAgent()
+sql_agent = SQLGeneratorAgent()
 retriever_agent = RetrieverAgent()
-vector_store    = VectorStore()
-doc_store       = DocStore()
-synth_agent     = SynthesizerAgent()
+vector_store = VectorStore()
+doc_store = DocStore()
+synth_agent = SynthesizerAgent()
 
 
 # ── models ────────────────────────────────────────────────────────────────────
 
 class AskRequest(BaseModel):
     question: str
+
 
 class AskResponse(BaseModel):
     question:        str
@@ -75,6 +117,7 @@ class AskResponse(BaseModel):
     from_cache:      bool = False
     doc_context:     list = []
     error:           str | None
+    error_code:      str | None = None
 
 
 # ── /ask ──────────────────────────────────────────────────────────────────────
@@ -83,22 +126,30 @@ class AskResponse(BaseModel):
 async def ask(req: AskRequest):
     question = req.question.strip()
     if not question:
-        raise HTTPException(status_code=400, detail="Question cannot be empty.")
+        raise HTTPException(
+            status_code=400, detail="Question cannot be empty.")
 
-    def err(msg: str, **kwargs) -> AskResponse:
+    def err(msg: str, code: str, **kwargs) -> AskResponse:
         return AskResponse(
             question=question, answer=None, sql_query=None,
             columns=[], rows=[], row_count=0,
             relevant_tables=kwargs.get("tables", []),
-            from_cache=False, error=msg,
+            from_cache=False, error=msg, error_code=code,
         )
 
     # Step 1 — Schema Agent (identifies relevant tables via Groq)
     try:
         relevant_tables = await schema_agent.identify_relevant_tables(question)
-        schema_text     = await schema_agent.format_for_prompt(question)
+        schema_text = await schema_agent.format_for_prompt(question)
     except Exception as exc:
-        return err(f"Schema Agent error: {exc}")
+        code = classify_llm_error(exc)
+        if code == ErrorCode.SQL_GENERATION_FAILED:
+            code = ErrorCode.INTERNAL_ERROR      # not an LLM problem
+        logger.error("Schema Agent failed [%s]: %r | cause=%r",
+                     code, exc, exc.__cause__)
+        msg = (MESSAGES[code] if code != ErrorCode.INTERNAL_ERROR
+               else f"Schema Agent error: {exc}")
+        return err(msg, code)
 
     # Step 2 — SQL Generator Agent
     sql_result = sql_agent.generate(question, schema_text)
@@ -110,47 +161,52 @@ async def ask(req: AskRequest):
             # Re-execute the cached SQL against the DB for fresh rows
             db_result = await retriever_agent.execute(cached["sql"], question, None)
             if not db_result["error"]:
-                cols      = db_result["columns"]
-                rows      = db_result["rows"]
+                cols = db_result["columns"]
+                rows = db_result["rows"]
                 row_count = db_result["row_count"]
                 # Build a simple answer from rows without calling Groq
                 answer = cached["answer"]
                 return AskResponse(
-                    question        = question,
-                    answer          = answer,
-                    sql_query       = cached["sql"],
-                    columns         = cols,
-                    rows            = rows,
-                    row_count       = row_count,
-                    relevant_tables = cached["tables"],
-                    retried         = False,
-                    from_cache      = True,
-                    doc_context     = [],
-                    error           = None,
+                    question=question,
+                    answer=answer,
+                    sql_query=cached["sql"],
+                    columns=cols,
+                    rows=rows,
+                    row_count=row_count,
+                    relevant_tables=cached["tables"],
+                    retried=False,
+                    from_cache=True,
+                    doc_context=[],
+                    error=None,
+                    error_code=None,
                 )
-        # No cache hit — return a friendly rate limit message
+        # No cache hit — return a friendly message with a stable error code
+        code = sql_result.get("error_code") or ErrorCode.SQL_GENERATION_FAILED
         wait_msg = "Groq rate limit reached. Please wait a few minutes and try again."
         if sql_result.get("error") and sql_result["error"] != "RATE_LIMIT":
             wait_msg = sql_result["error"]
-        return err(wait_msg, tables=relevant_tables)
+        return err(wait_msg, code, tables=relevant_tables)
 
     sql_query = sql_result["sql"]
 
     # Step 3 — Retriever Agent (with auto-retry via SQL Generator)
     db_result = await retriever_agent.execute(sql_query, question, sql_agent)
     if db_result["error"]:
+        logger.error("SQL execution failed: %s | sql=%s",
+                     db_result["error"], sql_query)
         return AskResponse(
             question=question, answer=None, sql_query=sql_query,
             columns=[], rows=[], row_count=0,
             relevant_tables=relevant_tables,
             from_cache=False, error=db_result["error"],
+            error_code=ErrorCode.SQL_EXECUTION_FAILED,
         )
 
-    columns   = db_result["columns"]
-    rows      = db_result["rows"]
+    columns = db_result["columns"]
+    rows = db_result["rows"]
     row_count = db_result["row_count"]
-    sql_used  = db_result.get("sql_used", sql_query)
-    retried   = db_result.get("retried", False)
+    sql_used = db_result.get("sql_used", sql_query)
+    retried = db_result.get("retried", False)
 
     # Step 4 — Document store search (augment context if relevant docs exist)
     doc_hits = doc_store.search(question, n_results=2)
@@ -161,29 +217,34 @@ async def ask(req: AskRequest):
     synth_result = synth_agent.synthesize(question, columns, rows, doc_hits)
     synth_from_cache = synth_result.get("from_cache", False)
     if synth_result["error"]:
+        logger.error("Synthesizer failed: %s", synth_result["error"])
         return AskResponse(
             question=question, answer=None, sql_query=sql_used,
             columns=columns, rows=rows, row_count=row_count,
             relevant_tables=relevant_tables, retried=retried,
             from_cache=False, doc_context=doc_context,
             error=synth_result["error"],
+            error_code=synth_result.get(
+                "error_code") or ErrorCode.INTERNAL_ERROR,
         )
 
     # ── Store successful result in vector cache ───────────────────────────────
-    vector_store.store(question, synth_result["answer"], sql_used, relevant_tables)
+    vector_store.store(
+        question, synth_result["answer"], sql_used, relevant_tables)
 
     return AskResponse(
-        question        = question,
-        answer          = synth_result["answer"],
-        sql_query       = sql_used,
-        columns         = columns,
-        rows            = rows,
-        row_count       = row_count,
-        relevant_tables = relevant_tables,
-        retried         = retried,
-        from_cache      = synth_from_cache,
-        doc_context     = doc_context,
-        error           = None,
+        question=question,
+        answer=synth_result["answer"],
+        sql_query=sql_used,
+        columns=columns,
+        rows=rows,
+        row_count=row_count,
+        relevant_tables=relevant_tables,
+        retried=retried,
+        from_cache=synth_from_cache,
+        doc_context=doc_context,
+        error=None,
+        error_code=None,
     )
 
 
@@ -193,7 +254,7 @@ async def ask(req: AskRequest):
 async def upload_doc(file: UploadFile = File(...)):
     """Upload a PDF or text file into the document knowledge base."""
     allowed = {".pdf", ".txt", ".md"}
-    ext     = os.path.splitext(file.filename)[1].lower()
+    ext = os.path.splitext(file.filename)[1].lower()
     if ext not in allowed:
         raise HTTPException(status_code=400,
                             detail=f"Unsupported file type '{ext}'. Allowed: {allowed}")
@@ -238,7 +299,9 @@ async def get_schema():
         schema = await schema_agent.get_schema()
         return {"schema": schema}
     except Exception as exc:
-        return JSONResponse(status_code=500, content={"error": str(exc)})
+        logger.error("Schema fetch failed: %r", exc)
+        return JSONResponse(status_code=500,
+                            content=error_body(ErrorCode.INTERNAL_ERROR))
 
 
 # ── /health ───────────────────────────────────────────────────────────────────
@@ -249,8 +312,12 @@ async def health():
         tables = await schema_agent.get_table_names()
         return {"status": "ok", "tables": tables}
     except Exception as exc:
-        return JSONResponse(status_code=500,
-                            content={"status": "error", "detail": str(exc)})
+        logger.error("Health check failed: %r", exc)
+        return JSONResponse(
+            status_code=500,
+            content={"status": "error", "detail": str(exc),
+                     **error_body(ErrorCode.INTERNAL_ERROR)},
+        )
 
 
 # ── /run-tests ───────────────────────────────────────────────────────────────
@@ -258,7 +325,10 @@ async def health():
 @app.get("/run-tests")
 async def run_tests():
     """Run pytest on tests/test_api.py and return structured results."""
-    import subprocess, sys, re, asyncio
+    import subprocess
+    import sys
+    import re
+    import asyncio
     from functools import partial
 
     def _run():
@@ -268,7 +338,7 @@ async def run_tests():
         )
         return result.stdout + result.stderr
 
-    loop   = asyncio.get_event_loop()
+    loop = asyncio.get_event_loop()
     output = await loop.run_in_executor(None, _run)
 
     # Parse individual test results
@@ -277,11 +347,12 @@ async def run_tests():
         m = re.match(r"tests[\\/].+::.+\s+(PASSED|FAILED|ERROR|SKIPPED)", line)
         if m:
             status = m.group(1)
-            name   = line.split("::")[1].split()[0] if "::" in line else line
+            name = line.split("::")[1].split()[0] if "::" in line else line
             tests.append({"name": name, "status": status})
 
     # Summary line
-    summary_match = re.search(r"(\d+ passed)?[,\s]*(\d+ failed)?[,\s]*(\d+ error)?.*in ([\d.]+)s", output)
+    summary_match = re.search(
+        r"(\d+ passed)?[,\s]*(\d+ failed)?[,\s]*(\d+ error)?.*in ([\d.]+)s", output)
     summary = summary_match.group(0) if summary_match else "unknown"
 
     passed = sum(1 for t in tests if t["status"] == "PASSED")
