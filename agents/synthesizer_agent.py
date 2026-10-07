@@ -64,9 +64,11 @@ class SynthesizerAgent:
                     {"role": "user",   "content": user_msg},
                 ],
                 temperature=0.3,
-                max_tokens=350,
+                max_tokens=1500,
             )
             answer = resp.choices[0].message.content.strip()
+            if not answer:
+                answer = _rows_to_plain_answer(question, columns, rows)
             return {"answer": answer, "error": None}
 
         except Exception as exc:
