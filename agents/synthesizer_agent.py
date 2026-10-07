@@ -45,7 +45,7 @@ class SynthesizerAgent:
         doc_section = ""
         if doc_hits:
             excerpts = "\n\n".join(
-                f"[From: {d['source']}]\n{d['text'][:400]}"
+                f"[From: {d['source']}]\n{d['text'][:900]}"
                 for d in doc_hits[:2]
             )
             doc_section = f"\n\nRelevant document excerpts:\n{excerpts}"
